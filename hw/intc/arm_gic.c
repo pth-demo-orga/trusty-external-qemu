@@ -1232,6 +1232,22 @@ static MemTxResult gic_cpu_read(GICState *s, int cpu, int offset,
             *data = s->abpr[cpu];
         }
         break;
+    case 0x20: /* Aliased Interrupt Acknowledge */
+        if (!gic_has_groups(s) || (s->security_extn && !attrs.secure)) {
+            *data = 0;
+        } else {
+            attrs.secure = false;
+            *data = gic_acknowledge_irq(s, cpu, attrs);
+        }
+        break;
+    case 0x28: /* Aliased Highest Priority Pending Interrupt */
+        if (!gic_has_groups(s) || (s->security_extn && !attrs.secure)) {
+            *data = 0;
+        } else {
+            attrs.secure = false;
+            *data = gic_get_current_pending_irq(s, cpu, attrs);
+        }
+        break;
     case 0xd0: case 0xd4: case 0xd8: case 0xdc:
     {
         int regno = (offset - 0xd0) / 4;
@@ -1285,6 +1301,14 @@ static MemTxResult gic_cpu_write(GICState *s, int cpu, int offset,
         break;
     case 0x10: /* End Of Interrupt */
         gic_complete_irq(s, cpu, value & 0x3ff, attrs);
+        return MEMTX_OK;
+    case 0x24: /* Aliased End Of Interrupt */
+        if (!gic_has_groups(s) || (s->security_extn && !attrs.secure)) {
+            /* unimplemented, or NS access: RAZ/WI */
+        } else {
+            attrs.secure = false;
+            gic_complete_irq(s, cpu, value & 0x3ff, attrs);
+        }
         return MEMTX_OK;
     case 0x1c: /* Aliased Binary Point */
         if (!gic_has_groups(s) || (s->security_extn && !attrs.secure)) {

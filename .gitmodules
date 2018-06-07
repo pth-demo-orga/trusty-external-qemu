@@ -22,9 +22,6 @@
 [submodule "roms/sgabios"]
 	path = roms/sgabios
 	url = git://git.qemu-project.org/sgabios.git
-[submodule "dtc"]
-	path = dtc
-	url = git://git.qemu-project.org/dtc.git
 [submodule "roms/u-boot"]
 	path = roms/u-boot
 	url = git://git.qemu-project.org/u-boot.git
@@ -34,9 +31,3 @@
 [submodule "roms/QemuMacDrivers"]
 	path = roms/QemuMacDrivers
 	url = git://git.qemu.org/QemuMacDrivers.git
-[submodule "ui/keycodemapdb"]
-	path = ui/keycodemapdb
-	url = git://git.qemu.org/keycodemapdb.git
-[submodule "capstone"]
-	path = capstone
-	url = git://git.qemu.org/capstone.git

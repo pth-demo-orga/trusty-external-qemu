@@ -94,6 +94,15 @@ FIELD(V7M_EXCRET, RES1, 7, 25) /* including the must-be-1 prefix */
 #define M_FAKE_FSR_NSC_EXEC 0xf /* NS executing in S&NSC memory */
 #define M_FAKE_FSR_SFAULT 0xe /* SecureFault INVTRAN, INVEP or AUVIOL */
 
+/**
+ * raise_exception: Raise the specified exception.
+ * Raise a guest exception with the specified value, syndrome register
+ * and target exception level. This should be called from helper functions,
+ * and never returns because we will longjump back up to the CPU main loop.
+ */
+void QEMU_NORETURN raise_exception(CPUARMState *env, uint32_t excp,
+                                   uint32_t syndrome, uint32_t target_el);
+
 /*
  * For AArch64, map a given EL to an index in the banked_spsr array.
  * Note that this mapping and the AArch32 mapping defined in bank_number()
@@ -136,7 +145,22 @@ static inline int bank_number(int mode)
     g_assert_not_reached();
 }
 
-void switch_mode(CPUARMState *, int);
+/**
+ * r14_bank_number: Map CPU mode onto register bank for r14
+ *
+ * Given an AArch32 CPU mode, return the index into the saved register
+ * banks to use for the R14 (LR) in that mode. This is the same as
+ * bank_number(), except for the special case of Hyp mode, where
+ * R14 is shared with USR and SYS, unlike its R13 and SPSR.
+ * This should be used as the index into env->banked_r14[], and
+ * bank_number() used for the index into env->banked_r13[] and
+ * env->banked_spsr[].
+ */
+static inline int r14_bank_number(int mode)
+{
+    return (mode == ARM_CPU_MODE_HYP) ? BANK_USRSYS : bank_number(mode);
+}
+
 void arm_cpu_register_gdb_regs_for_features(ARMCPU *cpu);
 void arm_translate_init(void);
 
@@ -243,6 +267,7 @@ enum arm_exception_class {
     EC_AA64_HVC               = 0x16,
     EC_AA64_SMC               = 0x17,
     EC_SYSTEMREGISTERTRAP     = 0x18,
+    EC_SVEACCESSTRAP          = 0x19,
     EC_INSNABORT              = 0x20,
     EC_INSNABORT_SAME_EL      = 0x21,
     EC_PCALIGNMENT            = 0x22,
@@ -269,14 +294,19 @@ enum arm_exception_class {
 #define ARM_EL_IL (1 << ARM_EL_IL_SHIFT)
 #define ARM_EL_ISV (1 << ARM_EL_ISV_SHIFT)
 
+static inline uint32_t syn_get_ec(uint32_t syn)
+{
+    return syn >> ARM_EL_EC_SHIFT;
+}
+
 /* Utility functions for constructing various kinds of syndrome value.
  * Note that in general we follow the AArch64 syndrome values; in a
  * few cases the value in HSR for exceptions taken to AArch32 Hyp
- * mode differs slightly, so if we ever implemented Hyp mode then the
- * syndrome value would need some massaging on exception entry.
- * (One example of this is that AArch64 defaults to IL bit set for
- * exceptions which don't specifically indicate information about the
- * trapping instruction, whereas AArch32 defaults to IL bit clear.)
+ * mode differs slightly, and we fix this up when populating HSR in
+ * arm_cpu_do_interrupt_aarch32_hyp().
+ * The exception is FP/SIMD access traps -- these report extra information
+ * when taking an exception to AArch32. For those we include the extra coproc
+ * and TA fields, and mask them out when taking the exception to AArch64.
  */
 static inline uint32_t syn_uncategorized(void)
 {
@@ -376,9 +406,23 @@ static inline uint32_t syn_cp15_rrt_trap(int cv, int cond, int opc1, int crm,
 
 static inline uint32_t syn_fp_access_trap(int cv, int cond, bool is_16bit)
 {
+    /* AArch32 FP trap or any AArch64 FP/SIMD trap: TA == 0 coproc == 0xa */
     return (EC_ADVSIMDFPACCESSTRAP << ARM_EL_EC_SHIFT)
         | (is_16bit ? 0 : ARM_EL_IL)
-        | (cv << 24) | (cond << 20);
+        | (cv << 24) | (cond << 20) | 0xa;
+}
+
+static inline uint32_t syn_simd_access_trap(int cv, int cond, bool is_16bit)
+{
+    /* AArch32 SIMD trap: TA == 1 coproc == 0 */
+    return (EC_ADVSIMDFPACCESSTRAP << ARM_EL_EC_SHIFT)
+        | (is_16bit ? 0 : ARM_EL_IL)
+        | (cv << 24) | (cond << 20) | (1 << 5);
+}
+
+static inline uint32_t syn_sve_access_trap(void)
+{
+    return EC_SVEACCESSTRAP << ARM_EL_EC_SHIFT;
 }
 
 static inline uint32_t syn_insn_abort(int same_el, int ea, int s1ptw, int fsc)
@@ -488,7 +532,39 @@ static inline void arm_clear_exclusive(CPUARMState *env)
 }
 
 /**
+ * ARMFaultType: type of an ARM MMU fault
+ * This corresponds to the v8A pseudocode's Fault enumeration,
+ * with extensions for QEMU internal conditions.
+ */
+typedef enum ARMFaultType {
+    ARMFault_None,
+    ARMFault_AccessFlag,
+    ARMFault_Alignment,
+    ARMFault_Background,
+    ARMFault_Domain,
+    ARMFault_Permission,
+    ARMFault_Translation,
+    ARMFault_AddressSize,
+    ARMFault_SyncExternal,
+    ARMFault_SyncExternalOnWalk,
+    ARMFault_SyncParity,
+    ARMFault_SyncParityOnWalk,
+    ARMFault_AsyncParity,
+    ARMFault_AsyncExternal,
+    ARMFault_Debug,
+    ARMFault_TLBConflict,
+    ARMFault_Lockdown,
+    ARMFault_Exclusive,
+    ARMFault_ICacheMaint,
+    ARMFault_QEMU_NSCExec, /* v8M: NS executing in S&NSC memory */
+    ARMFault_QEMU_SFault, /* v8M: SecureFault INVTRAN, INVEP or AUVIOL */
+} ARMFaultType;
+
+/**
  * ARMMMUFaultInfo: Information describing an ARM MMU Fault
+ * @type: Type of fault
+ * @level: Table walk level (for translation, access flag and permission faults)
+ * @domain: Domain of the fault address (for non-LPAE CPUs only)
  * @s2addr: Address that caused a fault at stage 2
  * @stage2: True if we faulted at stage 2
  * @s1ptw: True if we faulted at stage 2 while doing a stage 1 page-table walk
@@ -496,16 +572,179 @@ static inline void arm_clear_exclusive(CPUARMState *env)
  */
 typedef struct ARMMMUFaultInfo ARMMMUFaultInfo;
 struct ARMMMUFaultInfo {
+    ARMFaultType type;
     target_ulong s2addr;
+    int level;
+    int domain;
     bool stage2;
     bool s1ptw;
     bool ea;
 };
 
+/**
+ * arm_fi_to_sfsc: Convert fault info struct to short-format FSC
+ * Compare pseudocode EncodeSDFSC(), though unlike that function
+ * we set up a whole FSR-format code including domain field and
+ * putting the high bit of the FSC into bit 10.
+ */
+static inline uint32_t arm_fi_to_sfsc(ARMMMUFaultInfo *fi)
+{
+    uint32_t fsc;
+
+    switch (fi->type) {
+    case ARMFault_None:
+        return 0;
+    case ARMFault_AccessFlag:
+        fsc = fi->level == 1 ? 0x3 : 0x6;
+        break;
+    case ARMFault_Alignment:
+        fsc = 0x1;
+        break;
+    case ARMFault_Permission:
+        fsc = fi->level == 1 ? 0xd : 0xf;
+        break;
+    case ARMFault_Domain:
+        fsc = fi->level == 1 ? 0x9 : 0xb;
+        break;
+    case ARMFault_Translation:
+        fsc = fi->level == 1 ? 0x5 : 0x7;
+        break;
+    case ARMFault_SyncExternal:
+        fsc = 0x8 | (fi->ea << 12);
+        break;
+    case ARMFault_SyncExternalOnWalk:
+        fsc = fi->level == 1 ? 0xc : 0xe;
+        fsc |= (fi->ea << 12);
+        break;
+    case ARMFault_SyncParity:
+        fsc = 0x409;
+        break;
+    case ARMFault_SyncParityOnWalk:
+        fsc = fi->level == 1 ? 0x40c : 0x40e;
+        break;
+    case ARMFault_AsyncParity:
+        fsc = 0x408;
+        break;
+    case ARMFault_AsyncExternal:
+        fsc = 0x406 | (fi->ea << 12);
+        break;
+    case ARMFault_Debug:
+        fsc = 0x2;
+        break;
+    case ARMFault_TLBConflict:
+        fsc = 0x400;
+        break;
+    case ARMFault_Lockdown:
+        fsc = 0x404;
+        break;
+    case ARMFault_Exclusive:
+        fsc = 0x405;
+        break;
+    case ARMFault_ICacheMaint:
+        fsc = 0x4;
+        break;
+    case ARMFault_Background:
+        fsc = 0x0;
+        break;
+    case ARMFault_QEMU_NSCExec:
+        fsc = M_FAKE_FSR_NSC_EXEC;
+        break;
+    case ARMFault_QEMU_SFault:
+        fsc = M_FAKE_FSR_SFAULT;
+        break;
+    default:
+        /* Other faults can't occur in a context that requires a
+         * short-format status code.
+         */
+        g_assert_not_reached();
+    }
+
+    fsc |= (fi->domain << 4);
+    return fsc;
+}
+
+/**
+ * arm_fi_to_lfsc: Convert fault info struct to long-format FSC
+ * Compare pseudocode EncodeLDFSC(), though unlike that function
+ * we fill in also the LPAE bit 9 of a DFSR format.
+ */
+static inline uint32_t arm_fi_to_lfsc(ARMMMUFaultInfo *fi)
+{
+    uint32_t fsc;
+
+    switch (fi->type) {
+    case ARMFault_None:
+        return 0;
+    case ARMFault_AddressSize:
+        fsc = fi->level & 3;
+        break;
+    case ARMFault_AccessFlag:
+        fsc = (fi->level & 3) | (0x2 << 2);
+        break;
+    case ARMFault_Permission:
+        fsc = (fi->level & 3) | (0x3 << 2);
+        break;
+    case ARMFault_Translation:
+        fsc = (fi->level & 3) | (0x1 << 2);
+        break;
+    case ARMFault_SyncExternal:
+        fsc = 0x10 | (fi->ea << 12);
+        break;
+    case ARMFault_SyncExternalOnWalk:
+        fsc = (fi->level & 3) | (0x5 << 2) | (fi->ea << 12);
+        break;
+    case ARMFault_SyncParity:
+        fsc = 0x18;
+        break;
+    case ARMFault_SyncParityOnWalk:
+        fsc = (fi->level & 3) | (0x7 << 2);
+        break;
+    case ARMFault_AsyncParity:
+        fsc = 0x19;
+        break;
+    case ARMFault_AsyncExternal:
+        fsc = 0x11 | (fi->ea << 12);
+        break;
+    case ARMFault_Alignment:
+        fsc = 0x21;
+        break;
+    case ARMFault_Debug:
+        fsc = 0x22;
+        break;
+    case ARMFault_TLBConflict:
+        fsc = 0x30;
+        break;
+    case ARMFault_Lockdown:
+        fsc = 0x34;
+        break;
+    case ARMFault_Exclusive:
+        fsc = 0x35;
+        break;
+    default:
+        /* Other faults can't occur in a context that requires a
+         * long-format status code.
+         */
+        g_assert_not_reached();
+    }
+
+    fsc |= 1 << 9;
+    return fsc;
+}
+
+static inline bool arm_extabort_type(MemTxResult result)
+{
+    /* The EA bit in syndromes and fault status registers is an
+     * IMPDEF classification of external aborts. ARM implementations
+     * usually use this to indicate AXI bus Decode error (0) or
+     * Slave error (1); in QEMU we follow that.
+     */
+    return result != MEMTX_DECODE_ERROR;
+}
+
 /* Do a page table walk and add page to TLB if possible */
 bool arm_tlb_fill(CPUState *cpu, vaddr address,
                   MMUAccessType access_type, int mmu_idx,
-                  uint32_t *fsr, ARMMMUFaultInfo *fi);
+                  ARMMMUFaultInfo *fi);
 
 /* Return true if the stage 1 translation regime is using LPAE format page
  * tables */
@@ -526,11 +765,19 @@ void arm_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
                                    int mmu_idx, MemTxAttrs attrs,
                                    MemTxResult response, uintptr_t retaddr);
 
-/* Call the EL change hook if one has been registered */
+/* Call any registered EL change hooks */
+static inline void arm_call_pre_el_change_hook(ARMCPU *cpu)
+{
+    ARMELChangeHook *hook, *next;
+    QLIST_FOREACH_SAFE(hook, &cpu->pre_el_change_hooks, node, next) {
+        hook->hook(cpu, hook->opaque);
+    }
+}
 static inline void arm_call_el_change_hook(ARMCPU *cpu)
 {
-    if (cpu->el_change_hook) {
-        cpu->el_change_hook(cpu, cpu->el_change_hook_opaque);
+    ARMELChangeHook *hook, *next;
+    QLIST_FOREACH_SAFE(hook, &cpu->el_change_hooks, node, next) {
+        hook->hook(cpu, hook->opaque);
     }
 }
 
@@ -544,20 +791,118 @@ static inline bool regime_is_secure(CPUARMState *env, ARMMMUIdx mmu_idx)
     case ARMMMUIdx_S1NSE1:
     case ARMMMUIdx_S1E2:
     case ARMMMUIdx_S2NS:
+    case ARMMMUIdx_MPrivNegPri:
+    case ARMMMUIdx_MUserNegPri:
     case ARMMMUIdx_MPriv:
-    case ARMMMUIdx_MNegPri:
     case ARMMMUIdx_MUser:
         return false;
     case ARMMMUIdx_S1E3:
     case ARMMMUIdx_S1SE0:
     case ARMMMUIdx_S1SE1:
+    case ARMMMUIdx_MSPrivNegPri:
+    case ARMMMUIdx_MSUserNegPri:
     case ARMMMUIdx_MSPriv:
-    case ARMMMUIdx_MSNegPri:
     case ARMMMUIdx_MSUser:
         return true;
     default:
         g_assert_not_reached();
     }
 }
+
+/* Return the FSR value for a debug exception (watchpoint, hardware
+ * breakpoint or BKPT insn) targeting the specified exception level.
+ */
+static inline uint32_t arm_debug_exception_fsr(CPUARMState *env)
+{
+    ARMMMUFaultInfo fi = { .type = ARMFault_Debug };
+    int target_el = arm_debug_target_el(env);
+    bool using_lpae = false;
+
+    if (target_el == 2 || arm_el_is_aa64(env, target_el)) {
+        using_lpae = true;
+    } else {
+        if (arm_feature(env, ARM_FEATURE_LPAE) &&
+            (env->cp15.tcr_el[target_el].raw_tcr & TTBCR_EAE)) {
+            using_lpae = true;
+        }
+    }
+
+    if (using_lpae) {
+        return arm_fi_to_lfsc(&fi);
+    } else {
+        return arm_fi_to_sfsc(&fi);
+    }
+}
+
+/* Note make_memop_idx reserves 4 bits for mmu_idx, and MO_BSWAP is bit 3.
+ * Thus a TCGMemOpIdx, without any MO_ALIGN bits, fits in 8 bits.
+ */
+#define MEMOPIDX_SHIFT  8
+
+/**
+ * v7m_using_psp: Return true if using process stack pointer
+ * Return true if the CPU is currently using the process stack
+ * pointer, or false if it is using the main stack pointer.
+ */
+static inline bool v7m_using_psp(CPUARMState *env)
+{
+    /* Handler mode always uses the main stack; for thread mode
+     * the CONTROL.SPSEL bit determines the answer.
+     * Note that in v7M it is not possible to be in Handler mode with
+     * CONTROL.SPSEL non-zero, but in v8M it is, so we must check both.
+     */
+    return !arm_v7m_is_handler_mode(env) &&
+        env->v7m.control[env->v7m.secure] & R_V7M_CONTROL_SPSEL_MASK;
+}
+
+/**
+ * v7m_sp_limit: Return SP limit for current CPU state
+ * Return the SP limit value for the current CPU security state
+ * and stack pointer.
+ */
+static inline uint32_t v7m_sp_limit(CPUARMState *env)
+{
+    if (v7m_using_psp(env)) {
+        return env->v7m.psplim[env->v7m.secure];
+    } else {
+        return env->v7m.msplim[env->v7m.secure];
+    }
+}
+
+/**
+ * aarch32_mode_name(): Return name of the AArch32 CPU mode
+ * @psr: Program Status Register indicating CPU mode
+ *
+ * Returns, for debug logging purposes, a printable representation
+ * of the AArch32 CPU mode ("svc", "usr", etc) as indicated by
+ * the low bits of the specified PSR.
+ */
+static inline const char *aarch32_mode_name(uint32_t psr)
+{
+    static const char cpu_mode_names[16][4] = {
+        "usr", "fiq", "irq", "svc", "???", "???", "mon", "abt",
+        "???", "???", "hyp", "und", "???", "???", "???", "sys"
+    };
+
+    return cpu_mode_names[psr & 0xf];
+}
+
+/**
+ * arm_cpu_update_virq: Update CPU_INTERRUPT_VIRQ bit in cs->interrupt_request
+ *
+ * Update the CPU_INTERRUPT_VIRQ bit in cs->interrupt_request, following
+ * a change to either the input VIRQ line from the GIC or the HCR_EL2.VI bit.
+ * Must be called with the iothread lock held.
+ */
+void arm_cpu_update_virq(ARMCPU *cpu);
+
+/**
+ * arm_cpu_update_vfiq: Update CPU_INTERRUPT_VFIQ bit in cs->interrupt_request
+ *
+ * Update the CPU_INTERRUPT_VFIQ bit in cs->interrupt_request, following
+ * a change to either the input VFIQ line from the GIC or the HCR_EL2.VF bit.
+ * Must be called with the iothread lock held.
+ */
+void arm_cpu_update_vfiq(ARMCPU *cpu);
 
 #endif

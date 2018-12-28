@@ -340,8 +340,9 @@ static USBDevice *usb_try_create_simple(USBBus *bus, const char *name,
     }
     object_property_set_bool(OBJECT(dev), true, "realized", &err);
     if (err) {
-        error_propagate(errp, err);
-        error_prepend(errp, "Failed to initialize USB device '%s': ", name);
+        error_propagate_prepend(errp, err,
+                                "Failed to initialize USB device '%s': ",
+                                name);
         return NULL;
     }
     return dev;
@@ -556,28 +557,6 @@ int usb_device_detach(USBDevice *dev)
 
     usb_detach(port);
     dev->attached = false;
-    return 0;
-}
-
-int usb_device_delete_addr(int busnr, int addr)
-{
-    USBBus *bus;
-    USBPort *port;
-    USBDevice *dev;
-
-    bus = usb_bus_find(busnr);
-    if (!bus)
-        return -1;
-
-    QTAILQ_FOREACH(port, &bus->used, next) {
-        if (port->dev->addr == addr)
-            break;
-    }
-    if (!port)
-        return -1;
-    dev = port->dev;
-
-    object_unparent(OBJECT(dev));
     return 0;
 }
 
